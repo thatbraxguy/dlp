@@ -18,14 +18,26 @@ Every check yields ``_Candidate`` objects. Candidates are identified by content
 (not by file extension), turned into formats with yt-dlp's own manifest
 parsers, grouped into videos and merged.
 
+When the sweep finds nothing, two last resorts run before giving up:
+
+* ``borrow`` runs the logic of site-specific extractors whose URL pattern fits
+  this page's path (best of all, whose site the page mentions), as if the page
+  were on their site: their requests to that site are sent to this one.
+* ``browser`` opens the page in a headless browser (Playwright), lets the player
+  start, and resolves the media requests it makes.
+
 Options: ``--extractor-args "generic:KEY[=VALUE];..."`` (``universal:`` works as
 an alias): sweep, report, merge=smart|all|none, checks=, skip_checks=,
-max_scripts=, max_candidates=, iframe_depth=, probe_siblings.
+max_scripts=, max_candidates=, iframe_depth=, probe_siblings, borrow_ies=,
+borrow_max=, borrow_time=, borrow_min_path=, browser_wait=, browser_channel=.
 """
 
 import base64
 import binascii
+import contextlib
 import dataclasses
+import ipaddress
+import itertools
 import json
 import os
 import posixpath
@@ -36,6 +48,7 @@ import urllib.parse
 
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.extractor.generic import GenericIE
+from yt_dlp.networking import Request
 from yt_dlp.utils import (
     NO_DEFAULT,
     ExtractorError,
@@ -381,6 +394,7 @@ class _Candidate:
     referer: str = None
     hints: dict = dataclasses.field(default_factory=dict)  # per format: height, width, tbr, label
     meta: dict = dataclasses.field(default_factory=dict)  # per video: title, duration, thumbnail
+    headers: dict = dataclasses.field(default_factory=dict)  # extra request headers (browser check)
 
 
 @dataclasses.dataclass
@@ -433,6 +447,9 @@ class _Run:
         self.stats = {}  # check name -> {'found', 'time', 'error'}
         self.rows = []  # one per candidate, for the report
         self.counters = {}
+        self.borrow_tried = False
+        self.browser_tried = False
+        self.borrowed = None  # key of the extractor whose logic worked
 
     def stat(self, name):
         return self.stats.setdefault(name, {'found': 0, 'time': 0.0, 'error': None, 'formats': 0, 'media': 0})
@@ -478,6 +495,141 @@ def _site_for(url):
     host = (urllib.parse.urlparse(url).hostname or '').lower()
     matches = [d for d in _SITES if host == d or host.endswith('.' + d)]
     return max(matches, key=len, default=None)
+
+
+# --------------------------------------------------------------------------
+# Borrowing site extractors
+# --------------------------------------------------------------------------
+
+_BORROW_SKIP = frozenset(('generic', 'universal', 'universalsite'))
+_TEXT_URL_RE = re.compile(r'''(?i)(?:https?:)?//[^\s"'<>\\]+''')
+
+
+def _base_host(host):
+    """example.com for www.example.com or m.example.com; anything else unchanged"""
+    host = (host or '').lower().rstrip('.')
+    for prefix in ('www.', 'm.'):
+        if host.startswith(prefix) and host.count('.') >= 2:
+            return host[len(prefix):]
+    return host
+
+
+def _is_ip(host):
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+_IE_HOSTS = {}
+
+
+def _ie_hosts(cls):
+    """(scheme, host) of the extractor's own site, taken from its test URLs"""
+    if cls not in _IE_HOSTS:
+        hosts = []
+        tests = [getattr(cls, '_TEST', None), *(getattr(cls, '_TESTS', None) or [])]
+        for test in tests:
+            url = test.get('url') if isinstance(test, dict) else None
+            if not isinstance(url, str):
+                continue
+            try:
+                parsed = urllib.parse.urlparse(url)
+            except ValueError:
+                continue
+            pair = (parsed.scheme if parsed.scheme in ('http', 'https') else 'https', (parsed.hostname or '').lower())
+            if pair[1] and pair not in hosts:
+                hosts.append(pair)
+        _IE_HOSTS[cls] = hosts
+    return _IE_HOSTS[cls]
+
+
+class _HostMap:
+    """Sends a borrowed extractor's requests for its own site to the page's site"""
+
+    def __init__(self, orig_host, page_url):
+        page = urllib.parse.urlparse(page_url)
+        self.orig = _base_host(orig_host)
+        self.scheme = page.scheme or 'https'
+        self.netloc = page.netloc.rpartition('@')[2]
+        self.clone_base = _base_host(page.hostname)
+        # api.example.com -> api.clone.net, but not on an IP address or a bare name
+        self.subdomains = not _is_ip(page.hostname or '') and '.' in self.clone_base
+
+    def netloc_for(self, host):
+        """(new netloc, new scheme or None) for a host of the original site, else (None, None)"""
+        host = (host or '').lower().rstrip('.')
+        if host in (self.orig, f'www.{self.orig}', f'm.{self.orig}'):
+            return self.netloc, self.scheme
+        if self.subdomains and host.endswith('.' + self.orig):
+            return host[:-len(self.orig)] + self.clone_base, None
+        return None, None
+
+    def url(self, url):
+        if not isinstance(url, str) or '//' not in url:
+            return url
+        try:
+            parsed = urllib.parse.urlparse(url)
+            netloc, scheme = self.netloc_for(parsed.hostname)
+        except ValueError:
+            return url
+        if not netloc:
+            return url
+        # keep protocol-relative URLs protocol-relative
+        new_scheme = (scheme or parsed.scheme) if parsed.scheme else ''
+        return parsed._replace(netloc=netloc, scheme=new_scheme).geturl()
+
+    def text(self, text):
+        if not isinstance(text, str) or self.orig not in text.lower():
+            return text
+        return _TEXT_URL_RE.sub(lambda m: self.url(m.group(0)), text)
+
+    def deep(self, obj):
+        if isinstance(obj, str):
+            return self.text(obj)
+        if isinstance(obj, dict):
+            return {k: self.deep(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(self.deep(v) for v in obj)
+        return obj
+
+
+def _borrowed_class(cls, hostmap):
+    """A subclass of a site extractor that works on another site and never logs in"""
+
+    def _request_webpage(self, url_or_request, *args, **kwargs):
+        if isinstance(url_or_request, Request):
+            url_or_request.url = hostmap.url(url_or_request.url)
+            for key, value in list(url_or_request.headers.items()):
+                url_or_request.headers[key] = hostmap.text(value)
+        else:
+            url_or_request = hostmap.url(url_or_request)
+        if kwargs.get('headers'):
+            kwargs['headers'] = {k: hostmap.text(v) for k, v in kwargs['headers'].items()}
+        return super(borrowed, self)._request_webpage(url_or_request, *args, **kwargs)
+
+    def _set_cookie(self, domain, *args, **kwargs):
+        netloc, _ = hostmap.netloc_for(domain.lstrip('.'))
+        if netloc:
+            host = urllib.parse.urlparse(f'//{netloc}').hostname
+            super(borrowed, self)._set_cookie(('.' if domain.startswith('.') else '') + host, *args, **kwargs)
+        return super(borrowed, self)._set_cookie(domain, *args, **kwargs)
+
+    def _get_cookies(self, url):
+        return super(borrowed, self)._get_cookies(hostmap.url(url))
+
+    borrowed = type(cls.__name__, (cls,), {
+        '__module__': cls.__module__,
+        '__qualname__': cls.__qualname__,
+        # credentials for the original site must never be sent to another one
+        '_NETRC_MACHINE': None,
+        '_perform_login': lambda self, username, password: None,
+        '_request_webpage': _request_webpage,
+        '_set_cookie': _set_cookie,
+        '_get_cookies': _get_cookies,
+    })
+    return borrowed
 
 
 # --------------------------------------------------------------------------
@@ -634,8 +786,19 @@ class _UniversalGenericIE(GenericIE, plugin_name='universal'):
             return builtin
 
         run.swept = True
-        self.write_debug('Universal sweep: running extra checks')
         page = _Page(page_url, webpage, urlh, video_id, info_dict.get('title') or video_id)
+
+        # a site learned with dlp-add-site goes straight to what worked there
+        if not builtin and 'borrow_ies' in run.site_args:
+            entries = self._u_borrow(run, page)
+            if entries:
+                return entries
+        if not builtin and 'browser_first' in run.site_args:
+            entries = self._u_browser(run, page)
+            if entries:
+                return entries
+
+        self.write_debug('Universal sweep: running extra checks')
 
         items, passthrough = [], []
         for entry in builtin:
@@ -663,6 +826,9 @@ class _UniversalGenericIE(GenericIE, plugin_name='universal'):
             passthrough = [e for e in passthrough if e.get('ie_key') or self._u_claimed(e.get('url'))
                            or e.get('_type') not in ('url', None)]
         entries.extend(passthrough)
+        if not entries and not builtin:
+            # last resorts, in order of cost: another extractor's logic, then a real browser
+            entries = self._u_borrow(run, page) or self._u_browser(run, page)
         if not entries and builtin_error:
             raise builtin_error
         return entries
@@ -1154,7 +1320,7 @@ class _UniversalGenericIE(GenericIE, plugin_name='universal'):
 
     def _u_resolve(self, run, cand, video_id):
         """Turn a candidate into an _Item. Returns (item or None, status text)"""
-        headers = {'Referer': cand.referer} if cand.referer else {}
+        headers = {**({'Referer': cand.referer} if cand.referer else {}), **cand.headers}
         hinted = cand.kind
         if hinted in ('hls', 'dash', 'ism', 'hds', 'smil'):
             item = self._u_manifest_item(run, cand, hinted, video_id, headers)
@@ -1357,6 +1523,340 @@ class _UniversalGenericIE(GenericIE, plugin_name='universal'):
             entries.append(entry)
         return entries
 
+    # ---- last resort 1: borrow a site extractor's logic -------------------
+
+    def _u_borrow_candidates(self, page):
+        """Site extractors whose URL pattern fits this page's path, best first.
+
+        Each extractor's own site comes from its test URLs: the page URL is
+        rewritten onto that site and must then match the extractor's pattern.
+        A page that mentions the extractor's site (a script, an API, a CDN) is
+        the strongest sign of a clone or a white-label copy."""
+        parsed = urllib.parse.urlparse(page.url)
+        clone_base = _base_host(parsed.hostname)
+        html = page.webpage.lower()
+        only = self._u_arg('borrow_ies')
+        min_literal = self._u_int('borrow_min_path', 4)
+        best = {}
+        for key, ie in list(self._downloader._ies.items()):
+            low = key.lower()
+            if low in _BORROW_SKIP or (only is not None and low not in only):
+                continue
+            try:
+                cls = getattr(ie, 'real_class', ie)
+                if not cls.working() or cls._VALID_URL is False:
+                    continue
+                hosts = _ie_hosts(cls)
+            except Exception:
+                continue
+            for scheme, host in hosts:
+                base = _base_host(host)
+                if not base or base == clone_base:
+                    continue
+                trial = parsed._replace(scheme=scheme, netloc=host).geturl()
+                try:
+                    mobj = cls._match_valid_url(trial)
+                except Exception:
+                    mobj = None
+                if not mobj:
+                    continue
+                literal = self._u_required_chars(cls, trial, len(scheme) + 3 + len(host), mobj.end())
+                referenced = base in html
+                if only is None and not referenced and literal < min_literal:
+                    continue
+                whole = mobj.end() >= len(trial) or trial[mobj.end()] in '?#'
+                score = literal + (100 if referenced else 0) + (2 if whole else 0)
+                if key not in best or score > best[key][0]:
+                    best[key] = (score, cls, host, trial, referenced)
+        return sorted(best.items(), key=lambda kv: -kv[1][0])
+
+    @staticmethod
+    def _u_required_chars(ie, url, start, end):
+        r"""How many letters/digits of the path the extractor's pattern really requires.
+
+        Each one is swapped for another of its kind; if the URL then stops matching, the
+        pattern spelled it out: "/ft-watch/" counts 7, "(?:/[\w-]+)*" counts 0."""
+        path_end = min((i for i in (url.find('?', start), url.find('#', start)) if i >= 0), default=len(url))
+        dot = url.rfind('.', url.rfind('/', start, path_end) + 1, path_end)
+        if dot >= 0:
+            end = min(end, dot)  # a file extension (.html, .php) says little about the site
+        count = 0
+        for i in range(start, end):
+            char = url[i]
+            if char.isalpha() and char.isascii():
+                alt = 'z' if char.lower() == 'q' else 'q'
+                alt = alt.upper() if char.isupper() else alt
+            elif char.isdigit():
+                alt = '3' if char == '7' else '7'
+            else:
+                continue
+            try:
+                if not ie._match_valid_url(url[:i] + alt + url[i + 1:]):
+                    count += 1
+            except Exception:
+                pass
+        return count
+
+    def _u_borrow(self, run, page):
+        if run.borrow_tried or not self._u_enabled('borrow'):
+            return []
+        run.borrow_tried = True
+        stat, started = run.stat('borrow'), time.monotonic()
+        try:
+            ranked = self._u_borrow_candidates(page)
+        except Exception as e:
+            stat['error'] = f'{type(e).__name__}: {e}'
+            self.write_debug(f'Universal borrow failed:\n{traceback.format_exc()}')
+            ranked = []
+        limit, budget = self._u_int('borrow_max', 6), self._u_int('borrow_time', 120)
+        if ranked:
+            names = ', '.join(key for key, _ in ranked[:limit])
+            self._u_say(f'Nothing found on the page; trying the logic of site extractors that fit it: {names}')
+        result = []
+        for n, (key, (_, cls, host, trial, _referenced)) in enumerate(ranked):
+            cand = _Candidate(trial, 'borrow')
+            if n >= limit:
+                run.rows.append((cand, key, 0, 'skipped (borrow_max)'))
+                continue
+            if time.monotonic() - started > budget:
+                run.rows.append((cand, key, 0, 'skipped (borrow_time)'))
+                continue
+            stat['found'] += 1
+            entries, status = self._u_borrow_one(cls, key, host, trial, page)
+            formats = sum(len(e.get('formats') or [1]) for e in entries)
+            run.rows.append((cand, key, formats, status))
+            if entries and not result:
+                stat['media'] += 1
+                stat['formats'] += formats
+                run.borrowed = key
+                result = entries
+                break
+        stat['time'] += time.monotonic() - started
+        return result
+
+    def _u_borrow_one(self, cls, key, host, trial, page):
+        """Run one extractor as if the page were on its site. Returns (entries, status)"""
+        hostmap = _HostMap(host, page.url)
+        self.write_debug(f'Universal borrow: {key} on {trial}; requests for {hostmap.orig} go to {hostmap.netloc}')
+        try:
+            info = _borrowed_class(cls, hostmap)(self._downloader).extract(trial)
+        except Exception as e:  # any failure just means this extractor does not fit
+            msg = str(getattr(e, 'orig_msg', None) or e).strip().splitlines()
+            return [], (msg[0][:80] if msg else type(e).__name__)
+        entries = self._u_borrowed_entries(info, hostmap, page)
+        if not entries:
+            return [], 'no formats'
+        first = traverse_obj(entries, (0, 'entries', 0)) or entries[0]
+        ok, status = self._u_verify_formats(first.get('formats') or [first], page.video_id)
+        if not ok:
+            return [], status
+        for entry in entries:
+            entry['borrowed_extractor'] = key
+        return entries, status
+
+    def _u_borrowed_entries(self, info, hostmap, page):
+        """The extractor's result with the original site's URLs pointed at this one; only real media"""
+        if not isinstance(info, dict):
+            return []
+        kind = info.get('_type', 'video')
+        if kind in ('url', 'url_transparent'):
+            return []  # a pointer elsewhere, not media; following it could loop back here
+
+        def playable(entry):
+            return (isinstance(entry, dict) and entry.get('_type', 'video') == 'video'
+                    and (entry.get('formats') or entry.get('url')))
+
+        if kind in ('playlist', 'multi_video'):
+            try:
+                entries = [e for e in itertools.islice(iter(info.get('entries') or []), 100) if playable(e)]
+            except Exception:
+                entries = []
+            if not entries:
+                return []
+            info = {**info, 'entries': entries}
+        elif not playable(info):
+            return []
+        info = hostmap.deep({k: v for k, v in info.items() if k not in ('webpage_url', 'original_url')})
+        return [info]
+
+    def _u_verify_formats(self, formats, video_id):
+        """Check that the extractor's formats are real media, not guesses on the wrong site"""
+        checkable = [f for f in reversed(formats)
+                     if isinstance(f, dict) and not f.get('has_drm') and (f.get('manifest_url') or f.get('url'))]
+        if not checkable:
+            return True, 'ok (not verified)'
+        status = 'formats are not media'
+        for fmt in checkable[:2]:
+            url = fmt.get('manifest_url') or fmt.get('url')
+            headers = {**(fmt.get('http_headers') or {}), 'Accept-Encoding': 'identity'}
+            try:
+                urlh = self._request_webpage(url, video_id, note=False, headers=headers)
+            except ExtractorError as e:
+                code = getattr(e.cause, 'status', None)
+                status = f'formats unreachable (HTTP {code})' if code else 'formats unreachable'
+                continue
+            try:
+                first = urlh.read(4096)
+            except Exception:
+                first = b''
+            finally:
+                urlh.close()
+            kind, reason = _sniff(first, urlh.headers.get('Content-Type') or '')
+            if kind:
+                return True, 'ok'
+            status = f'formats are not media ({reason})'
+        return False, status
+
+    # ---- last resort 2: a headless browser --------------------------------
+
+    _U_PLAY_SELECTORS = (
+        '.vjs-big-play-button', '.jw-display-icon-container', '.plyr__control--overlaid',
+        '.fp-play', '.mejs__overlay-button', '.ytp-large-play-button', '.play-button', '.btn-play',
+        'button[aria-label*="play" i]', 'button[title*="play" i]', '[class*="play"][class*="button"]',
+    )
+    _U_NUDGE_JS = '''(selectors) => {
+        for (const v of document.querySelectorAll('video, audio')) {
+            try { v.muted = true; const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+        }
+        for (const s of selectors) {
+            const el = document.querySelector(s);
+            if (el) { try { el.click(); } catch (e) {} }
+        }
+        return {
+            srcs: Array.from(document.querySelectorAll('video, audio, video source, audio source'))
+                .map(el => el.currentSrc || el.src).filter(src => src && /^https?:/.test(src)),
+            players: document.querySelectorAll('video, audio, iframe, object, embed').length,
+        };
+    }'''
+
+    def _u_browser(self, run, page):
+        """Open the page in a headless browser and resolve the media requests its player makes"""
+        if run.browser_tried or not self._u_enabled('browser'):
+            return []
+        run.browser_tried = True
+        stat, started = run.stat('browser'), time.monotonic()
+        try:
+            candidates = self._u_browser_capture(page)
+        except ImportError:
+            stat['error'] = 'Playwright is not installed'
+            self.write_debug('Universal browser: Playwright is not installed; skipping')
+            candidates = []
+        except Exception as e:
+            stat['error'] = f'{type(e).__name__}: {str(e).splitlines()[0][:120] if str(e) else ""}'
+            self.write_debug(f'Universal browser failed:\n{traceback.format_exc()}')
+            candidates = []
+        stat['found'] += len(candidates)
+        stat['time'] += time.monotonic() - started
+        if not candidates:
+            return []
+        items = self._u_resolve_all(run, candidates, set(), page)
+        return self._u_build_entries(items, page.video_id, page.title)
+
+    def _u_browser_capture(self, page):
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+
+        wait = self._u_int('browser_wait', 20)
+        channel = traverse_obj(self._u_arg('browser_channel'), 0)
+        endpoint = os.environ.get('DLP_BROWSER_CDP')
+        user_agent = traverse_obj(self._downloader.params, ('http_headers', 'User-Agent'))
+        page_base = _base_host(urllib.parse.urlparse(page.url).hostname)
+        seen = {}  # url -> kind guess, in the order the player asked for them
+
+        def covers_page(domain):
+            domain = _base_host(domain.lstrip('.'))
+            return page_base == domain or page_base.endswith('.' + domain)
+
+        def note(url, kind):
+            if not url.startswith(('http://', 'https://')) or url in seen:
+                return
+            host = urllib.parse.urlparse(url).hostname or ''
+            if _JUNK_HOST_RE.search(host) or _NON_MEDIA_EXT_RE.search(url):
+                return
+            seen[url] = kind
+
+        def on_request(req):
+            kind = _url_kind(req.url)
+            if kind or req.resource_type == 'media':
+                note(req.url, kind)
+
+        def on_response(resp):
+            kind = _mime_kind((resp.headers.get('content-type') or '').split(';')[0])
+            if kind:
+                note(resp.url, kind)
+
+        self._u_say(f'Still nothing; opening the page in a headless browser (up to {wait} s)')
+        with sync_playwright() as pw:
+            if endpoint:
+                browser = pw.chromium.connect_over_cdp(endpoint)
+            else:
+                browser, last_error = None, None
+                for option in ([channel] if channel else [None, 'chrome', 'msedge']):
+                    try:
+                        browser = pw.chromium.launch(headless=True, **({'channel': option} if option else {}))
+                        break
+                    except PlaywrightError as e:
+                        last_error = e
+                if browser is None:
+                    raise ExtractorError(
+                        'No browser for Playwright: run "playwright install chromium" or install Chrome',
+                        cause=last_error, expected=True)
+            try:
+                context = browser.new_context(**({'user_agent': user_agent} if user_agent else {}))
+                # the user's cookies for this site (--cookies, --cookies-from-browser) carry logins over
+                cookies = [{
+                    'name': c.name, 'value': c.value or '', 'domain': c.domain, 'path': c.path or '/',
+                    'secure': bool(c.secure), **({'expires': float(c.expires)} if c.expires else {}),
+                } for c in self.cookiejar if c.domain and covers_page(c.domain)]
+                if cookies:
+                    with contextlib.suppress(PlaywrightError):
+                        context.add_cookies(cookies)
+                tab = context.new_page()
+                # pop-ups (ads opened by a click) are closed straight away
+                context.on('page', lambda popup: popup.close() if popup != tab else None)
+                tab.on('request', on_request)
+                tab.on('response', on_response)
+                try:
+                    tab.goto(page.url, wait_until='domcontentloaded', timeout=wait * 1000)
+                except PlaywrightError as e:
+                    self.write_debug(f'Universal browser: page load: {e}')
+                begun = time.monotonic()
+                deadline, nudged, settle, players = begun + wait, 0, None, 0
+                while time.monotonic() < deadline:
+                    manifests = [u for u, k in seen.items() if k in ('hls', 'dash', 'ism', 'hds')]
+                    if (manifests or seen) and settle is None:
+                        settle = time.monotonic() + (2 if manifests else 4)  # collect alternates
+                    if settle and time.monotonic() > settle:
+                        break
+                    if nudged < 3 and time.monotonic() > begun + 2 + 3 * nudged:
+                        nudged += 1
+                        for frame in tab.frames:
+                            try:
+                                found = frame.evaluate(self._U_NUDGE_JS, list(self._U_PLAY_SELECTORS))
+                            except PlaywrightError:
+                                continue
+                            players += found.get('players') or 0
+                            for src in found.get('srcs') or []:
+                                note(src, _url_kind(src) or 'http')
+                    elif nudged == 3 and not seen and not players:
+                        break  # no player anywhere on the page and nothing requested: stop early
+                    tab.wait_for_timeout(500)
+                try:
+                    title = tab.title()
+                except PlaywrightError:
+                    title = None
+                jar_cookies = context.cookies()
+            finally:
+                browser.close()
+
+        # cookies the page set (tokens) are needed to fetch what it requested
+        for c in jar_cookies:
+            self._set_cookie(c['domain'], c['name'], c['value'], path=c.get('path') or '/',
+                             secure=bool(c.get('secure')), expire_time=int(c['expires']) if c.get('expires', -1) > 0 else None)
+        if title and page.title in (None, page.video_id, 'video'):
+            page.title = title
+        return [_Candidate(url, 'browser', kind=kind, referer=page.url) for url, kind in seen.items()]
+
     # ---- report ----------------------------------------------------------
 
     @staticmethod
@@ -1372,6 +1872,7 @@ class _UniversalGenericIE(GenericIE, plugin_name='universal'):
             'builtin': run.builtin,
             'redirect_to': run.redirect_to,
             'error': error,
+            'borrowed': run.borrowed,
             'checks': run.stats,
             'candidates': [
                 {'check': cand.source, 'url': cand.url, 'kind': kind, 'formats': count, 'result': status}
@@ -1394,7 +1895,7 @@ class _UniversalGenericIE(GenericIE, plugin_name='universal'):
                 self._u_say('Universal sweep not run: the URL itself is media, a manifest or a feed')
             return
 
-        names = ['builtin', *(name for name, _ in self._U_CHECKS), 'sibling-probe']
+        names = ['builtin', *(name for name, _ in self._U_CHECKS), 'sibling-probe', 'borrow', 'browser']
         rows = []
         for name in names:
             stat = run.stats.get(name)

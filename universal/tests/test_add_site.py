@@ -6,7 +6,6 @@ End-to-end tests for dlp-add-site (dlp_tools/add_site.py) against the fixture se
 """
 
 import functools
-import http.server
 import json
 import os
 import pathlib
@@ -16,7 +15,7 @@ import tempfile
 import threading
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from test_universal import FIXTURES, ISOLATED_CONFIG, REPO, YTDLP, Handler, entries_of, kinds  # noqa: E402
+from test_universal import FIXTURES, ISOLATED_CONFIG, PYTHONPATH, YTDLP, Handler, Server, entries_of, kinds  # noqa: E402
 
 VERBOSE = '-v' in sys.argv[1:]
 failures = []
@@ -31,7 +30,7 @@ def check(name, condition, detail=''):
 
 
 def main():
-    server = http.server.ThreadingHTTPServer(
+    server = Server(
         ('127.0.0.1', 0), functools.partial(Handler, directory=str(FIXTURES)))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_port
@@ -39,7 +38,7 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         sites_file = pathlib.Path(tmp, 'sites.json')
-        env = {**os.environ, 'PYTHONPATH': str(REPO), 'YTDLP_UNIVERSAL_SITES': str(sites_file),
+        env = {**os.environ, 'PYTHONPATH': PYTHONPATH, 'YTDLP_UNIVERSAL_SITES': str(sites_file),
                'XDG_CONFIG_HOME': ISOLATED_CONFIG}
 
         def script(*args):
@@ -102,6 +101,12 @@ def main():
         proc = script('--remove', 'localhost')
         check('--remove drops one site', proc.returncode == 0 and set(sites()) == {'127.0.0.1'}, proc.stdout)
         check('  removed site is back to stock', ytdlp(f'{name}/pages/builtin_html5.html') == [{'http'}])
+
+        proc = script(f'{name}/ft-watch/10001')
+        saved = sites().get('localhost', {})
+        check('add a clone site: the borrowed extractor is pinned',
+              proc.returncode == 0 and saved.get('args', {}).get('borrow_ies') == ['FakeTube'], proc.stdout)
+        check('  another page of the clone works', ytdlp(f'{name}/ft-watch/30003') == [{'http'}])
         check('a .bak of the previous file is kept', sites_file.with_suffix('.json.bak').exists())
 
     server.shutdown()

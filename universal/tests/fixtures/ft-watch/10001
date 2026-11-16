@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<html><head><title>Clone page one</title>
+<link rel="preconnect" href="https://static.faketube.example">
+</head><body>
+<!-- a white-label copy of faketube: same player markup, its own domain -->
+<div id="player" data-ft-key="k3y-10001"></div>
+<script>var ft = {id: 10001};</script>
+</body></html>

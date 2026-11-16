@@ -31,7 +31,9 @@ RUN_TIMEOUT = 240
 PLAYLIST_LIMIT = 25
 
 # Tried in order; the first that finds media wins. Options are the plugin's
-# extractor-args (see the README), stored as lists of strings.
+# extractor-args (see the README), stored as lists of strings. Every step also
+# ends with the plugin's last resorts (borrowing a site extractor's logic, then
+# a headless browser); later steps skip those, as they do not change.
 LADDER = [
     ('standard sweep', {}, False),
     ('standard sweep, pretending to be a browser', {'impersonate': ['']}, True),
@@ -40,6 +42,8 @@ LADDER = [
     ('deep sweep, pretending to be a browser',
      {'max_scripts': ['25'], 'max_candidates': ['80'], 'iframe_depth': ['3'], 'impersonate': ['']}, True),
 ]
+LAST_RESORTS = ['borrow', 'browser']
+INSTALL_BROWSER = 'uv tool install --reinstall "yt-dlp[default,browser] @ git+https://github.com/thatbraxguy/dlp"'
 KIND_NAMES = {'hls': 'HLS', 'dash': 'DASH', 'smooth': 'Smooth', 'http': 'file'}
 
 
@@ -123,6 +127,11 @@ class Result:
     def swept(self):
         return [r for r in self.reports if r.get('swept')]
 
+    @property
+    def borrowed(self):
+        """The site extractor whose logic found the media, if that is how it was found"""
+        return next((r['borrowed'] for r in self.reports if r.get('borrowed')), None)
+
     def finders(self):
         """Names of the checks whose candidates turned into media"""
         names = []
@@ -185,7 +194,8 @@ def last_error(result):
 def explain_failure(results, extra):
     """Say, in plain words, why no strategy worked and what could be tried"""
     swept = [report for result in results for report in result.swept]
-    candidates = max((report.get('candidates') or [] for report in swept), key=len, default=[])
+    candidates = max(([c for c in report.get('candidates') or [] if c.get('check') != 'borrow']
+                      for report in swept), key=len, default=[])
     print()
     if any(result.drm for result in results):
         print('The streams on this page are DRM-protected. yt-dlp cannot download those and this')
@@ -202,10 +212,11 @@ def explain_failure(results, extra):
             print('If the page needs a login, retry with your browser session:')
             print('  dlp-add-site URL -- --cookies-from-browser firefox')
         return
+    explain_last_resorts(swept)
     if not candidates:
-        print('No media URL was found in the page, its JSON, its scripts or its iframes.')
-        print('The player most likely builds the stream URL in JavaScript or asks an API for it.')
-        print('A static scan cannot see that; this site needs a hand-written extractor.')
+        print('No media URL was found in the page, its JSON, its scripts or its iframes,')
+        print('no site extractor\'s logic fitted it, and the browser saw no stream either.')
+        print('This site needs a hand-written extractor.')
         return
     print(f'{len(candidates)} possible media URLs were found, but none turned out to be playable:')
     for cand in candidates[:8]:
@@ -215,6 +226,22 @@ def explain_failure(results, extra):
     if refused and not extra:
         print('Some were refused by the server. If the site needs a login, retry with your session:')
         print('  dlp-add-site URL -- --cookies-from-browser firefox')
+
+
+def explain_last_resorts(swept):
+    tried = [c for report in swept for c in report.get('candidates') or []
+             if c.get('check') == 'borrow' and not str(c.get('result', '')).startswith('skipped')]
+    if tried:
+        names = ', '.join(f'{c["kind"]} ({c["result"]})' for c in tried[:5])
+        print(f'Site extractors whose URL pattern fits were tried as if this were their site: {names}')
+    browser = next((r['checks']['browser'] for r in swept if (r.get('checks') or {}).get('browser')), None)
+    if browser and browser.get('error') == 'Playwright is not installed':
+        print('The headless-browser step was skipped: Playwright is not installed. To add it:')
+        print(f'  {INSTALL_BROWSER}')
+    elif browser and browser.get('error'):
+        print(f'The headless-browser step failed: {browser["error"]}')
+    elif browser:
+        print(f'A headless browser opened the page and saw {browser.get("found", 0)} media request(s).')
 
 
 def add_site(args, ytdlp, extra):
@@ -258,10 +285,11 @@ def add_site(args, ytdlp, extra):
             step += 1
             print(f'  {step}. {label} ...', flush=True)
             trial = {**base_args, **strategy}
-            result = run_ytdlp(ytdlp, url, {**others, domain: {'args': trial}}, extra, workdir, args.verbose)
+            run_args = trial if not results else {**trial, 'skip_checks': LAST_RESORTS}
+            result = run_ytdlp(ytdlp, url, {**others, domain: {'args': run_args}}, extra, workdir, args.verbose)
             results.append(result)
             if not result.reports:
-                print('\nThe universal plugin did not run. Check that `yt-dlp -v` lists')
+                print('\nThe universal plugin did not run. Check that `dlp -v` lists')
                 print('"Extractor Plugins: UniversalIE, UniversalSiteIE, universal (GenericIE)".')
                 return 1
             blocked = blocked or result.blocked
@@ -275,6 +303,13 @@ def add_site(args, ytdlp, extra):
             print(f'\n{domain} was not added.' + (' Its existing entry was left as it is.' if updating else ''))
             return 1
         label, site_args, result = chosen
+        # remember the last resort that worked, so the site goes straight to it next time
+        if result.borrowed:
+            site_args = {**site_args, 'borrow_ies': [result.borrowed]}
+            label += f', using the logic of the {result.borrowed} extractor'
+        elif result.finders() == ['browser']:
+            site_args = {**site_args, 'browser_first': ['']}
+            label += ', in a headless browser'
 
         # worth asking the server for the other manifest format?
         if {'hls', 'dash'} & set(result.kinds) and not {'hls', 'dash'} <= set(result.kinds):
@@ -289,8 +324,10 @@ def add_site(args, ytdlp, extra):
                 print('     nothing extra')
 
     # an explicit --merge is a setting the user wants stored, gain or not
+    # (a last resort that worked is still worth pinning: next time it is tried first, and alone)
+    pinned = 'borrow_ies' in site_args or 'browser_first' in site_args
     if (stock.ok and result.formats <= stock.formats and set(result.kinds) <= set(stock.kinds)
-            and not args.force and not args.merge):
+            and not args.force and not args.merge and not pinned):
         print('\nyt-dlp already gets everything from this page that the sweep finds.')
         print('Nothing was changed. Use --force to add the site anyway.')
         return 0
@@ -320,7 +357,7 @@ def add_site(args, ytdlp, extra):
     if extra:
         print(f'  The analysis used: {" ".join(extra)}  (pass the same to yt-dlp when downloading)')
     print(f'\nNow this works for any page on {domain}:')
-    print(f'  yt-dlp "{url}"')
+    print(f'  dlp "{url}"')
     return 0
 
 

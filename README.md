@@ -16,10 +16,12 @@
 >
 > - The commands are `dlp` and `dlp-add-site`, so it can be installed next to upstream's `yt-dlp`.
 >   The Python package is still `yt_dlp` (distribution `yt-dlp`), so programs that import yt-dlp, such as MeTube, can use it.
-> - The universal extractor plugin is built in (`yt_dlp_plugins/extractor/universal.py`); see [universal/README.md](universal/README.md).
+> - The universal extractor plugin is built in (`yt_dlp_plugins/extractor/universal.py`): for pages no site extractor handles, it
+>   sweeps the page for media, then borrows the logic of site extractors that fit, then tries a headless browser.
+>   See [universal/README.md](universal/README.md).
 > - `.github/workflows/sync-upstream.yml` merges upstream `master` daily; upstream's own workflows are disabled here.
 >
-> Install: `uv tool install "yt-dlp[default] @ git+https://github.com/thatbraxguy/dlp"`
+> Install: `uv tool install "yt-dlp[default,browser] @ git+https://github.com/thatbraxguy/dlp"` (drop `browser` to skip the headless-browser fallback)
 
 <!-- MANPAGE: END EXCLUDED SECTION -->
 

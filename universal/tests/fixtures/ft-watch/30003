@@ -1,0 +1,5 @@
+<!DOCTYPE html>
+<html><head><title>Clone page three</title></head><body>
+<!-- same markup, and nothing on the page names faketube -->
+<div id="player" data-ft-key="k3y-30003"></div>
+</body></html>

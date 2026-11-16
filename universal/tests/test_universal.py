@@ -9,6 +9,7 @@ yt_dlp from this repository (python -m yt_dlp, plugin included) against each one
 
 import base64
 import functools
+import importlib.util
 import http.server
 import json
 import os
@@ -28,6 +29,11 @@ VERBOSE = '-v' in sys.argv[1:]
 ONLY = [a for a in sys.argv[1:] if not a.startswith('-')]
 # An empty config home, so an installed copy of this plugin is not loaded as well
 ISOLATED_CONFIG = tempfile.mkdtemp(prefix='yt-dlp-universal-test-')
+# This checkout, plus the test-only FakeTube extractor the borrow cases lend from
+PYTHONPATH = os.pathsep.join((str(REPO), str(FIXTURES / 'plugins')))
+# Browser cases need Playwright in the Python that runs yt-dlp, e.g.
+#   uv run --with playwright python universal/tests/test_universal.py
+HAS_PLAYWRIGHT = importlib.util.find_spec('playwright') is not None
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -58,9 +64,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class Server(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # a browser dropping a media request half-way is normal, not a failure
+        if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            super().handle_error(request, client_address)
+
+
 def run_ytdlp(url, *args):
     # the plugin from this checkout, and never the user's own added sites
-    env = {**os.environ, 'PYTHONPATH': str(REPO), 'YTDLP_UNIVERSAL_SITES': os.devnull,
+    env = {**os.environ, 'PYTHONPATH': PYTHONPATH, 'YTDLP_UNIVERSAL_SITES': os.devnull,
            'XDG_CONFIG_HOME': ISOLATED_CONFIG}
     proc = subprocess.run(
         [*YTDLP, '--ignore-config', '--no-warnings', '-J', *args, url],
@@ -126,6 +139,21 @@ CASES = [
     ('nothing: page without media is still unsupported', 'nothing.html', [], None, None),
     ('direct manifest URL: unchanged generic path', '/media/vid10001/hls/master.m3u8', [], [{'hls'}], None),
     ('direct file URL: unchanged generic path', '/media/vid10001/clip_180p.mp4', [], [{'http'}], None),
+    ('borrow: a clone of a site extractor\'s site, which the page names', '/ft-watch/10001', [], [{'http'}],
+     lambda info, reqs: (info.get('borrowed_extractor') == 'FakeTube' and info.get('title') == 'Clone Video One') or f'borrowed_extractor={info.get("borrowed_extractor")!r} title={info.get("title")!r}'),
+    ('borrow: the clone\'s API is asked, not the original site\'s', '/ft-watch/10001', [], [{'http'}],
+     lambda _, reqs: '/api/video/10001.json' in reqs or f'requests were {reqs}'),
+    ('borrow: page does not name the site; the path pattern alone is enough', '/ft-watch/30003', [], [{'http'}],
+     lambda info, reqs: (info.get('borrowed_extractor') == 'FakeTube' and info.get('title') == 'Clone Video Three') or f'borrowed_extractor={info.get("borrowed_extractor")!r} title={info.get("title")!r}'),
+    ('borrow: an extractor that does not fit the page fails cleanly', '/ft-watch/20002', [], None, None),
+    ('borrow off: skip_checks=borrow', '/ft-watch/10001',
+     ['--extractor-args', 'generic:skip_checks=borrow,browser'], None, None),
+    ('borrow_ies: only the named extractor is tried', '/ft-watch/10001',
+     ['--extractor-args', 'generic:borrow_ies=faketube'], [{'http'}], lambda info, reqs: (info.get('borrowed_extractor') == 'FakeTube' and info.get('title') == 'Clone Video One') or f'borrowed_extractor={info.get("borrowed_extractor")!r} title={info.get("title")!r}'),
+    ('browser: stream URL assembled by JavaScript and fetched', 'browser_fetch.html', [], [{'hls'}], None),
+    ('browser: <video> src set by JavaScript', 'browser_video.html', [], [{'http'}], None),
+    ('browser off: skip_checks=browser', 'browser_fetch.html',
+     ['--extractor-args', 'generic:skip_checks=browser'], None, None),
     ('report: table printed on stderr', 'multi_format.html',
      ['--extractor-args', 'generic:report'], [{'hls', 'dash', 'http'}],
      lambda info, reqs, stderr='': True),
@@ -135,7 +163,7 @@ CASES = [
 def main():
     if not (FIXTURES / 'media').is_dir():
         sys.exit('Run tests/make_fixtures.sh first')
-    server = http.server.ThreadingHTTPServer(
+    server = Server(
         ('127.0.0.1', 0), functools.partial(Handler, directory=str(FIXTURES)))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f'http://127.0.0.1:{server.server_port}'
@@ -143,6 +171,9 @@ def main():
     failed = 0
     for name, page, args, expected, extra in CASES:
         if ONLY and not any(o in name for o in ONLY):
+            continue
+        if name.startswith('browser:') and not HAS_PLAYWRIGHT:
+            print(f'skip  {name}  (Playwright not installed)')
             continue
         prefix, _, page = page.rpartition(':')
         url = base + (page if page.startswith('/') else f'/pages/{page}')

@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<html><head><title>Browser Fetch Video</title></head><body>
+<video id="v"></video>
+<script>
+  // the stream URL only exists once this runs, so no static check can see it
+  var p = ['/med', 'ia/vid1', '0001/hls/mas', 'ter.m3', 'u8'];
+  fetch(p.join('')).then(function (r) { return r.text(); });
+</script>
+</body></html>
