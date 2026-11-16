@@ -1750,6 +1750,15 @@ class _UniversalGenericIE(GenericIE, plugin_name='universal'):
         if not candidates:
             return []
         items = self._u_resolve_all(run, candidates, set(), page)
+        # A player that loaded a master playlist then loads its quality/audio playlists
+        # too; those are already formats of the master, not videos of their own.
+        def plain_playlist(item):
+            return item.kind == 'hls' and all(f.get('manifest_url') in (None, f.get('url')) for f in item.formats)
+        if any(i.kind == 'hls' and not plain_playlist(i) for i in items):
+            dropped = {i.url for i in items if plain_playlist(i)}
+            items = [i for i in items if i.url not in dropped]
+            run.rows = [(c, k, n, 'rendition of the master playlist' if c.url in dropped else status)
+                        for c, k, n, status in run.rows]
         return self._u_build_entries(items, page.video_id, page.title)
 
     def _u_browser_capture(self, page):

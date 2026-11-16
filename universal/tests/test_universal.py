@@ -150,7 +150,7 @@ CASES = [
      ['--extractor-args', 'generic:skip_checks=borrow,browser'], None, None),
     ('borrow_ies: only the named extractor is tried', '/ft-watch/10001',
      ['--extractor-args', 'generic:borrow_ies=faketube'], [{'http'}], lambda info, reqs: (info.get('borrowed_extractor') == 'FakeTube' and info.get('title') == 'Clone Video One') or f'borrowed_extractor={info.get("borrowed_extractor")!r} title={info.get("title")!r}'),
-    ('browser: stream URL assembled by JavaScript and fetched', 'browser_fetch.html', [], [{'hls'}], None),
+    ('browser: stream URL assembled by JavaScript; its quality playlist is not a second video', 'browser_fetch.html', [], [{'hls'}], None),
     ('browser: <video> src set by JavaScript', 'browser_video.html', [], [{'http'}], None),
     ('browser off: skip_checks=browser', 'browser_fetch.html',
      ['--extractor-args', 'generic:skip_checks=browser'], None, None),

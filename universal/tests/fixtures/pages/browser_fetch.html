@@ -4,6 +4,9 @@
 <script>
   // the stream URL only exists once this runs, so no static check can see it
   var p = ['/med', 'ia/vid1', '0001/hls/mas', 'ter.m3', 'u8'];
-  fetch(p.join('')).then(function (r) { return r.text(); });
+  // like a real player: the master playlist, then one of its quality playlists
+  fetch(p.join('')).then(function (r) { return r.text(); }).then(function () {
+    return fetch(['/media/vid10001/hls/medi', 'a.m3', 'u8'].join(''));
+  });
 </script>
 </body></html>
