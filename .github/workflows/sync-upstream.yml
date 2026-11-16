@@ -1,0 +1,32 @@
+name: Sync from upstream yt-dlp
+
+# dlp fork: merge yt-dlp/yt-dlp master into this fork's master every day.
+# Uses GitHub's "Sync fork" API. A conflict makes this run fail, and GitHub emails the owner.
+# SYNC_TOKEN: fine-grained token for this repo only, Contents + Workflows read/write
+# (the default GITHUB_TOKEN may not push upstream changes to workflow files).
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Merge upstream master
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::SYNC_TOKEN secret is not set"
+            exit 1
+          fi
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=master \
+            --jq '"\(.merge_type): \(.message)"'

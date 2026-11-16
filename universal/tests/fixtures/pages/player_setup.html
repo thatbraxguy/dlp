@@ -1,0 +1,12 @@
+<!DOCTYPE html><html><head><title>Player setup page</title></head><body><div id="p"></div>
+<script>
+  myPlayer.setup({
+    title: 'Setup Video',
+    sources: [
+      {file: '/media/vid10001/hls/master.m3u8'},
+      {file: '/media/vid10001/clip_180p.mp4', label: '180p'}
+    ],
+    onReady: function () { track('ready'); }
+  });
+</script>
+</body></html>

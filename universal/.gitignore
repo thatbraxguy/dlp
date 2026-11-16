@@ -1,0 +1,3 @@
+tests/fixtures/media/
+__pycache__/
+*.pyc

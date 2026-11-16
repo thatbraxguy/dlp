@@ -138,7 +138,9 @@ Tracker = "https://github.com/yt-dlp/yt-dlp/issues"
 Funding = "https://github.com/yt-dlp/yt-dlp/blob/master/Maintainers.md#maintainers"
 
 [project.scripts]
-yt-dlp = "yt_dlp:main"
+# dlp fork: its own command names, so it never shadows an upstream yt-dlp on PATH
+dlp = "yt_dlp:main"
+dlp-add-site = "dlp_tools.add_site:main"
 
 [project.entry-points.pyinstaller40]
 hook-dirs = "yt_dlp.__pyinstaller:get_hook_dirs"
@@ -146,6 +148,9 @@ hook-dirs = "yt_dlp.__pyinstaller:get_hook_dirs"
 [tool.hatch.build.targets.sdist]
 include = [
     "/yt_dlp",
+    "/yt_dlp_plugins",  # dlp fork: universal extractor plugin
+    "/dlp_tools",  # dlp fork: dlp-add-site
+    "/universal",  # dlp fork: plugin docs and tests
     "/devscripts",
     "/test",
     "/.gitignore",  # included by default, needed for auto-excludes
@@ -164,7 +169,7 @@ artifacts = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["yt_dlp"]
+packages = ["yt_dlp", "yt_dlp_plugins", "dlp_tools"]  # dlp fork: plugin and dlp-add-site ship in the wheel
 artifacts = [
     "/yt_dlp/extractor/lazy_extractors.py",
 ]
